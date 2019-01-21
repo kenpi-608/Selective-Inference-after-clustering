@@ -10,6 +10,7 @@ import copy
 import scipy.stats as stats
 import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import dendrogram
+import pandas as pd
 
 
 class Cluster:
@@ -72,6 +73,12 @@ def intersection(forL, forU, interval):
     区間の共通部分を計算する
     Created on Thu Oct 19 11:59:46 2017
     @author: Inoue.S
+    arg1: forL
+        Lower (scalar)
+    arg2: forU
+        Upper (scalar)
+    arg3: interval
+        Array of the section (two-dimentional array) size: (x, 2)
     """
     intersect = []
     lower = forL
@@ -118,6 +125,34 @@ def calc_multisec_p(tau, sig, interval):
     selective_p = numerator / denominator
     assert len(np.where(selective_p < 0)[0]) <= 0, "selective_p < 0"
     return numerator / denominator
+
+
+def calc_multisec_p_improve(tau, sig, interval):
+    """複数の区間がある場合のSelective-p値を計算する"""
+    denominator = []
+    numerator = []
+    d = len(tau)
+    for j in range(d):
+        t_j = tau[j] / sig[j]
+        interval_j = interval[j] / sig[j]
+        if interval_j.ndim < 2:
+            interval_j = interval_j.reshape((-1, 2))
+        l_j = interval_j[:, 0]
+        u_j = interval_j[:, 1]
+        denominator.append(np.sum(stats.norm.cdf(-l_j) - stats.norm.cdf(-u_j)))
+        # どの区間に統計量が属するか
+        p = np.argmax((l_j <= t_j) * (t_j <= u_j))
+        if p + 1 < len(l_j):
+            upper_section = np.sum(stats.norm.cdf(-l_j[p + 1:]) - stats.norm.cdf(-u_j[p + 1:]))
+        else:
+            upper_section = 0
+        numerator.append(stats.norm.cdf(-t_j) - stats.norm.cdf(-u_j[p]) + upper_section)
+    denominator = np.array(denominator)
+    numerator = np.array(numerator)
+    selective_p = numerator / denominator
+    assert len(np.where(selective_p < 0)[0]) <= 0, "selective_p < 0"
+    return numerator / denominator
+
 
 def kstest(d, result_p, step):
     """
@@ -209,13 +244,17 @@ def ward(data):
     c_ab_list = []
     a_list = []
     b_list = []
+    delta_list = []
+    tau_list = []
     for t in range(n - 1):
 #            print("--------------------%d step --------------------" % t)
-        # 距離行列の最小値とインデックスを取得する
         [minvalue, [a, b]] = [dmat.min(), list(np.argwhere(dmat == dmat.min())[0])]
         c_id = [c_list[a].index, c_list[b].index]
-        # クラスタを統合する
         c_ab = c_list[a].merge(c_list[b], index)
+        delta = c_list[a].table / c_list[a].size - c_list[b].table / c_list[b].size
+        delta_list.append(delta)
+        tau = c_list[a].centroid - c_list[b].centroid
+        tau_list.append(tau)
         c_list.append(c_ab)
         index = index + 1
         # 新しくできたクラスタと残りのクラスタの距離を計算
@@ -237,17 +276,14 @@ def ward(data):
          # 統合されたクラスタを削除, 距離行列からも該当箇所を削除
         del (c_list[a])
         del (c_list[b - 1])
-        # 行
         dmat = np.delete(dmat, [a, b], 0)
-        # 列
         dmat = np.delete(dmat, [a, b], 1)
-        # 新しい距離を挿入
         dmat = np.hstack((dmat, np.c_[new_dis]))
         dmat = np.vstack((dmat, np.inf * np.ones(dmat.shape[1])))
         # 結果のフォーマットを整える
         result = [c_id[0], c_id[1], minvalue, c_list[len(c_list) - 1].size]
         output.append(result)
-    return output, c_list_list, c_ab_list, a_list, b_list
+    return output, c_list_list, c_ab_list, a_list, b_list, delta_list, tau_list
 
 
 def pci_ward(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, tol=10**(-12)):
@@ -366,8 +402,7 @@ def pci_ward(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, tol=
                     vbc_array = np.r_[vbc_array, p_vbc_array]
                     cbc_array = np.r_[cbc_array, p_cbc_array]
 #            print("vbv_array:", len(vbv_array))
-                
-            
+                        
             # 切断点計算
             forL_list = []
             forU_list = []
@@ -442,6 +477,7 @@ def pci_ward(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, tol=
                     interval.append(np.array([[L, U]]))
                     
             interval = np.array(interval)
+            print("correct interval \n", interval)
             # 検定
             sig = np.sqrt(sigma_tilde2)
 #             print(sig)
@@ -454,5 +490,766 @@ def pci_ward(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, tol=
 
     return naive_p_step, selective_p_step
 
+"""
+ver2
+ある階層についての検定のみ行う
+"""
+def pci_ward_2(data, sigma, xi, node, c_list_list, c_ab_list, a_list, b_list, tol=10**(-12)):
+    """
+    Selective Inference at each step of hierarchical clustering
+    each feature
+    """
+    n = data.shape[0]
+    d = data.shape[1]
+    assert (node >= 0) & (node <= n - 2), "please input node = 0 ~ n-2" 
+    c_list = copy.deepcopy(c_list_list[node])
+    c_ab = copy.deepcopy(c_ab_list[node])
+    a = a_list[node]
+    b = b_list[node]
+    """Selective Inferenceの計算"""
+    tau = np.abs(c_list[a].centroid - c_list[b].centroid)
+    s = np.sign(c_list[a].centroid - c_list[b].centroid)
+    delta = c_list[a].table / c_list[a].size - c_list[b].table / c_list[b].size
+    delta_h = np.dot(sigma, delta)
+    sigma_tilde2 = np.diag(xi) * np.dot(np.dot(delta, sigma), delta)
+    """
+    このstepで必要なevent
+    """
+    vbv_list = []
+    cbc_list = []
+    vbc_list = []
+    e_cab = np.sum((c_ab.element - c_ab.centroid) ** 2)
+    e_ca = np.sum((c_list[a].element - c_list[a].centroid) ** 2)
+    e_cb = np.sum((c_list[b].element - c_list[b].centroid) ** 2)
+    delta_a = np.dot(c_list[a].table, delta_h) / c_list[a].size
+    delta_b = np.dot(c_list[b].table, delta_h) / c_list[b].size
+    d_ab = delta_a - delta_b
+    abab = (c_list[a].size * c_list[b].size) / c_ab.size
+    abx = c_list[a].centroid - c_list[b].centroid
+    for k1 in range(n - t - 1):
+        for k2 in range(k1 + 1, n - t):
+            if (k1, k2) != (a, b):
+                c_k12 = c_list[k1].merge(c_list[k2], 0)            
+                e_ck12 = np.sum((c_k12.element - c_k12.centroid) ** 2)
+                e_ck1 = np.sum((c_list[k1].element - c_list[k1].centroid) ** 2)
+                e_ck2 = np.sum((c_list[k2].element - c_list[k2].centroid) ** 2)
+                delta_k1 = np.dot(c_list[k1].table, delta_h) / c_list[k1].size
+                delta_k2 = np.dot(c_list[k2].table, delta_h) / c_list[k2].size
+                d_k12 = delta_k1 - delta_k2
+                k12 = (c_list[k1].size * c_list[k2].size) / c_k12.size
+                k12x = c_list[k1].centroid - c_list[k2].centroid
+                # vbvは必ず0以下となる
+                vbv = e_cab - e_ck12 - e_ca + e_ck1 - e_cb + e_ck2
+                assert vbv <= 0, "vbv > 0 occured"
+                vbv_list.append(vbv)
+                scalar = abab * (d_ab**2) - k12 * (d_k12**2)
+                cbc = (s**2 * scalar * np.diag(np.dot(xi.T, xi))) / sigma_tilde2 ** 2
+                cbc_list.append(cbc)
+                d_vec = abab * d_ab * abx - k12 * d_k12 * k12x 
+                vbc = (s * np.dot(d_vec, xi)) / sigma_tilde2
+                vbc_list.append(vbc)
+    # {}_(n- t + 1) C_2個
+    vbv_array = np.array(vbv_list)
+    # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+    cbc_array = np.array(cbc_list)
+    # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+    vbc_array = np.array(vbc_list)
+#            # L, Uがともに0となることを防ぐために閾値をもうける
+#            cbc_array[np.abs(cbc_array) < tol] = 0
+#            vbc_array[np.abs(vbc_array) < tol] = 0
+    
+    # このステップまでのSelection Eventでの計算
+    for i3 in range(t + 1):
+        old_c_list = copy.deepcopy(c_list_list[i3])
+        old_c_ab = copy.deepcopy(c_ab_list[i3])
+        p_vbv_list = []
+        p_cbc_list = []
+        p_vbc_list = []
+        e_cab = np.sum((old_c_ab.element - old_c_ab.centroid) ** 2)
+        e_ca = np.sum((old_c_list[a_list[i3]].element - old_c_list[a_list[i3]].centroid) ** 2)
+        e_cb = np.sum((old_c_list[b_list[i3]].element - old_c_list[b_list[i3]].centroid) ** 2)
+        delta_a = np.dot(old_c_list[a_list[i3]].table, delta_h) / old_c_list[a_list[i3]].size
+        delta_b = np.dot(old_c_list[b_list[i3]].table, delta_h) / old_c_list[b_list[i3]].size
+        d_ab = delta_a - delta_b
+        abab = (old_c_list[a_list[i3]].size * old_c_list[b_list[i3]].size) / old_c_ab.size
+        abx = old_c_list[a_list[i3]].centroid - old_c_list[b_list[i3]].centroid
+        for k1 in range(len(old_c_list) - 2):
+            for k2 in range(k1 + 1, len(old_c_list) - 1):
+                if k1 != k2:
+                    c_k12 = old_c_list[k1].merge(old_c_list[k2], 0)            
+                    e_ck12 = np.sum((c_k12.element - c_k12.centroid) ** 2)
+                    e_ck1 = np.sum((old_c_list[k1].element - old_c_list[k1].centroid) ** 2)
+                    e_ck2 = np.sum((old_c_list[k2].element - old_c_list[k2].centroid) ** 2)
+                    delta_k1 = np.dot(old_c_list[k1].table, delta_h) / old_c_list[k1].size
+                    delta_k2 = np.dot(old_c_list[k2].table, delta_h) / old_c_list[k2].size
+                    d_k12 = delta_k1 - delta_k2
+                    k12 = (old_c_list[k1].size * old_c_list[k2].size) / c_k12.size
+                    k12x = old_c_list[k1].centroid - old_c_list[k2].centroid
+                    # vbvは必ず0以下となる
+                    p_vbv = e_cab - e_ck12 - e_ca + e_ck1 - e_cb + e_ck2
+                    assert p_vbv <= 0, "p_vbv > 0 occured"
+                    p_vbv_list.append(p_vbv)
+                    scalar = abab * (d_ab**2) - k12 * (d_k12**2) 
+                    p_cbc = (s**2 * scalar * np.diag(np.dot(xi.T, xi))) / sigma_tilde2 ** 2
+                    p_cbc_list.append(p_cbc)
+                    d_vec = abab * d_ab * abx - k12 * d_k12 * k12x
+                    p_vbc = (s * np.dot(d_vec, xi)) / sigma_tilde2
+                    p_vbc_list.append(p_vbc)
+        p_vbv_array = np.array(p_vbv_list)
+        p_vbc_array = np.array(p_vbc_list)
+        p_cbc_array = np.array(p_cbc_list)
+        if vbv_array.shape[0] == 0:
+            vbv_array = p_vbv_array
+            vbc_array = p_vbc_array
+            cbc_array = p_cbc_array
+        else:
+            vbv_array = np.r_[vbv_array, p_vbv_array]
+            vbc_array = np.r_[vbc_array, p_vbc_array]
+            cbc_array = np.r_[cbc_array, p_cbc_array]
 
+    # 切断点計算
+    forL_list = []
+    forU_list = []
+    interval = []
+    for j in range(d):
+#               # 判別式
+        """
+        切断点計算
+        """
+        discriminant = vbc_array[:, j]**2 - cbc_array[:, j] * vbv_array
+        cond = cbc_array[:, j] == 0
+        cond_l = (cbc_array[:, j] == 0) & (vbc_array[:, j] < 0)
+        cond_u = (cbc_array[:, j] == 0) & (vbc_array[:, j] > 0)
+        if cbc_array[cond].shape[0] > 0:
+            if vbc_array[:, j][cond_l].shape[0] > 0:
+                forL = np.max(-vbv_array[cond_l] / (2 * vbc_array[:, j][cond_l]))
+                forL_list.append(forL)
+            elif vbc_array[:, j][cond_u].shape[0] > 0:
+                forU = np.min(-vbv_array[cond_u] / (2 * vbc_array[:, j][cond_u]))
+                forU_list.append(forU)
+        cond2 = cbc_array[:, j] > 0
+        if cbc_array[:, j][cond2].shape[0] > 0:
+            forL = np.max((-vbc_array[:, j][cond2] - np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+            forL_list.append(forL)
+            forU = np.min((-vbc_array[:, j][cond2] + np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+            forU_list.append(forU)
+            
+        """
+        分岐focus
+        """
+        if len(forL_list) > 0:
+            forL = max(forL_list)
+        else:
+            forL = -np.inf
+        if len(forU_list) > 0:
+            forU = min(forU_list)
+        else:
+            forU = np.inf
+        forL = max(forL, -tau[j])     
+        forL_list = []
+        forU_list = []
+        cond3 = (cbc_array[:, j] < 0) & (discriminant > 0)    
+        if cbc_array[:, j][cond3].shape[0] > 0:
+            x_small = (-vbc_array[:, j][cond3] + np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+            x_large = (-vbc_array[:, j][cond3] - np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+            # x_small < forL < x_large
+            flag1 = (x_small < forL) & (forL < x_large)
+            while np.sum(flag1) > 0:
+                if x_large[flag1].shape[0] > 0: 
+                    x_large_max = np.max(x_large[flag1])
+                    forL = x_large_max
+                flag1 = (x_small < forL) & (forL < x_large)
+            # x_small < forU < x_large
+            flag2 = (x_small < forU) & (forU < x_large)
+            while np.sum(flag2) > 0:
+                if x_small[flag2].shape[0] > 0:
+                    x_small_min = np.min(x_small[flag2])
+                    forU = x_small_min
+                flag2 = (x_small < forU) & (forU < x_large)
+            # forL < x_small, x_large < forU
+            flag3 = (forL < x_small) & (x_large < forU)
+            if np.sum(flag3) > 0:
+                interval_j = np.array(intersection(forL, forU, np.c_[x_small, x_large][flag3]))
+                interval.append(interval_j + tau[j])
+            else:
+                interval.append(np.array([[forL, forU]]) + tau[j])                
+        else:
+            L = forL + tau[j]
+            if L < 0:
+                L = 0
+            U = forU + tau[j]
+            interval.append(np.array([[L, U]]))
+            
+    interval = np.array(interval)
+    # 検定
+    sig = np.sqrt(sigma_tilde2)
+    sub1 = stats.norm.cdf(tau / sig)
+    sub2 = stats.norm.cdf(-tau / sig)
+    naive_p = 2 * np.min(np.c_[sub1, sub2], axis=1)
+    selective_p = calc_multisec_p(tau, sig, interval)  
+    
+    """進捗状況"""
+#    file = open('out.txt', 'w')  #書き込みモードでオープン
+#    string = str(t) + 'step\n'
+#    file.write(string)
+    
+    return naive_p, selective_p
+
+
+def pci_ward_improve(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, tol=10**(-12)):
+    """
+    Selective Inference at each step of hierarchical clustering
+    each feature
+    """
+    n = data.shape[0]
+    d = data.shape[1]        
+    naive_p_step = []
+    selective_p_step = []
+    for t in range(n - 1):
+        c_list = copy.deepcopy(c_list_list[t])
+        c_ab = copy.deepcopy(c_ab_list[t])
+        a = a_list[t]
+        b = b_list[t]
+        if t < stop:
+#            print("--------------------%d step --------------------" % t)
+            """Selective Inferenceの計算"""
+            tau = np.abs(c_list[a].centroid - c_list[b].centroid)
+            s = np.sign(c_list[a].centroid - c_list[b].centroid)
+            delta = c_list[a].table / c_list[a].size - c_list[b].table / c_list[b].size
+            delta_h = np.dot(sigma, delta)
+            sigma_tilde2 = np.diag(xi) * np.dot(np.dot(delta, sigma), delta)
+            # 切断点の計算に必要なものの準備
+            vbv_list = []
+            cbc_list = []
+            vbc_list = []
+            e_cab = np.sum((c_ab.element - c_ab.centroid) ** 2)
+            e_ca = np.sum((c_list[a].element - c_list[a].centroid) ** 2)
+            e_cb = np.sum((c_list[b].element - c_list[b].centroid) ** 2)
+            delta_a = np.dot(c_list[a].table, delta_h) / c_list[a].size
+            delta_b = np.dot(c_list[b].table, delta_h) / c_list[b].size
+            d_ab = delta_a - delta_b
+            abab = (c_list[a].size * c_list[b].size) / c_ab.size
+            abx = c_list[a].centroid - c_list[b].centroid
+            for k1 in range(n - t - 1):
+                for k2 in range(k1 + 1, n - t):
+                    if (k1, k2) != (a, b):
+                        c_k12 = c_list[k1].merge(c_list[k2], 0)            
+                        e_ck12 = np.sum((c_k12.element - c_k12.centroid) ** 2)
+                        e_ck1 = np.sum((c_list[k1].element - c_list[k1].centroid) ** 2)
+                        e_ck2 = np.sum((c_list[k2].element - c_list[k2].centroid) ** 2)
+                        delta_k1 = np.dot(c_list[k1].table, delta_h) / c_list[k1].size
+                        delta_k2 = np.dot(c_list[k2].table, delta_h) / c_list[k2].size
+                        d_k12 = delta_k1 - delta_k2
+                        k12 = (c_list[k1].size * c_list[k2].size) / c_k12.size
+                        k12x = c_list[k1].centroid - c_list[k2].centroid
+                        # vbvは必ず0以下となる
+                        vbv = e_cab - e_ck12 - e_ca + e_ck1 - e_cb + e_ck2
+                        assert vbv <= 0, "vbv > 0 occured"
+                        vbv_list.append(vbv)
+                        scalar = abab * (d_ab**2) - k12 * (d_k12**2)
+                        cbc = (s**2 * scalar * np.diag(np.dot(xi.T, xi))) / sigma_tilde2 ** 2
+                        cbc_list.append(cbc)
+                        d_vec = abab * d_ab * abx - k12 * d_k12 * k12x 
+                        vbc = (s * np.dot(d_vec, xi)) / sigma_tilde2
+                        vbc_list.append(vbc)
+            # {}_(n- t + 1) C_2個
+            vbv_array = np.array(vbv_list)
+            # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+            cbc_array = np.array(cbc_list)
+            # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+            vbc_array = np.array(vbc_list)
+#            # L, Uがともに0となることを防ぐために閾値をもうける
+#            cbc_array[np.abs(cbc_array) < tol] = 0
+#            vbc_array[np.abs(vbc_array) < tol] = 0
+            
+            # このステップまでのSelection Eventでの計算
+            for i3 in range(t + 1):
+                old_c_list = copy.deepcopy(c_list_list[i3])
+                old_c_ab = copy.deepcopy(c_ab_list[i3])
+                p_vbv_list = []
+                p_cbc_list = []
+                p_vbc_list = []
+                e_cab = np.sum((old_c_ab.element - old_c_ab.centroid) ** 2)
+                e_ca = np.sum((old_c_list[a_list[i3]].element - old_c_list[a_list[i3]].centroid) ** 2)
+                e_cb = np.sum((old_c_list[b_list[i3]].element - old_c_list[b_list[i3]].centroid) ** 2)
+                delta_a = np.dot(old_c_list[a_list[i3]].table, delta_h) / old_c_list[a_list[i3]].size
+                delta_b = np.dot(old_c_list[b_list[i3]].table, delta_h) / old_c_list[b_list[i3]].size
+                d_ab = delta_a - delta_b
+                abab = (old_c_list[a_list[i3]].size * old_c_list[b_list[i3]].size) / old_c_ab.size
+                abx = old_c_list[a_list[i3]].centroid - old_c_list[b_list[i3]].centroid
+                for k1 in range(len(old_c_list) - 2):
+                    for k2 in range(k1 + 1, len(old_c_list) - 1):
+                        if k1 != k2:
+                            c_k12 = old_c_list[k1].merge(old_c_list[k2], 0)            
+                            e_ck12 = np.sum((c_k12.element - c_k12.centroid) ** 2)
+                            e_ck1 = np.sum((old_c_list[k1].element - old_c_list[k1].centroid) ** 2)
+                            e_ck2 = np.sum((old_c_list[k2].element - old_c_list[k2].centroid) ** 2)
+                            delta_k1 = np.dot(old_c_list[k1].table, delta_h) / old_c_list[k1].size
+                            delta_k2 = np.dot(old_c_list[k2].table, delta_h) / old_c_list[k2].size
+                            d_k12 = delta_k1 - delta_k2
+                            k12 = (old_c_list[k1].size * old_c_list[k2].size) / c_k12.size
+                            k12x = old_c_list[k1].centroid - old_c_list[k2].centroid
+                            # vbvは必ず0以下となる
+                            p_vbv = e_cab - e_ck12 - e_ca + e_ck1 - e_cb + e_ck2
+                            assert p_vbv <= 0, "p_vbv > 0 occured"
+                            p_vbv_list.append(p_vbv)
+                            scalar = abab * (d_ab**2) - k12 * (d_k12**2) 
+                            p_cbc = (s**2 * scalar * np.diag(np.dot(xi.T, xi))) / sigma_tilde2 ** 2
+                            p_cbc_list.append(p_cbc)
+                            d_vec = abab * d_ab * abx - k12 * d_k12 * k12x
+                            p_vbc = (s * np.dot(d_vec, xi)) / sigma_tilde2
+                            p_vbc_list.append(p_vbc)
+                p_vbv_array = np.array(p_vbv_list)
+                p_vbc_array = np.array(p_vbc_list)
+                p_cbc_array = np.array(p_cbc_list)
+                if vbv_array.shape[0] == 0:
+                    vbv_array = p_vbv_array
+                    vbc_array = p_vbc_array
+                    cbc_array = p_cbc_array
+                else:
+                    vbv_array = np.r_[vbv_array, p_vbv_array]
+                    vbc_array = np.r_[vbc_array, p_vbc_array]
+                    cbc_array = np.r_[cbc_array, p_cbc_array]
+            
+            # 切断点計算
+            forL_list = []
+            forU_list = []
+            interval = []
+            for j in range(d):
+#               # 判別式
+                """
+                切断点計算
+                """
+                discriminant = vbc_array[:, j]**2 - cbc_array[:, j] * vbv_array
+                cond = cbc_array[:, j] == 0
+                cond_l = (cbc_array[:, j] == 0) & (vbc_array[:, j] < 0)
+                cond_u = (cbc_array[:, j] == 0) & (vbc_array[:, j] > 0)
+                if cbc_array[cond].shape[0] > 0:
+                    if vbc_array[:, j][cond_l].shape[0] > 0:
+                        forL = np.max(-vbv_array[cond_l] / (2 * vbc_array[:, j][cond_l]))
+                        forL_list.append(forL)
+                    elif vbc_array[:, j][cond_u].shape[0] > 0:
+                        forU = np.min(-vbv_array[cond_u] / (2 * vbc_array[:, j][cond_u]))
+                        forU_list.append(forU)
+                cond2 = cbc_array[:, j] > 0
+                if cbc_array[:, j][cond2].shape[0] > 0:
+                    argmax = np.argmax((-vbc_array[:, j][cond2] - np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                    hit_vbc_L = vbc_array[:, j][cond2][argmax]
+                    hit_cbc_L = cbc_array[:, j][cond2][argmax]
+                    hit_vbv_L = vbv_array[cond2][argmax]
+                    forL = np.max((-vbc_array[:, j][cond2] - np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                    forL_list.append(forL)
+                    argmin = np.argmin((-vbc_array[:, j][cond2] - np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                    hit_vbc_U = vbc_array[:, j][cond2][argmin]
+                    hit_cbc_U = cbc_array[:, j][cond2][argmin]
+                    hit_vbv_U = vbv_array[cond2][argmin]
+                    forU = np.min((-vbc_array[:, j][cond2] + np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                    forU_list.append(forU)
+                    
+                """
+                分岐focus
+                """
+                if len(forL_list) > 0:
+                    forL = max(forL_list)
+                else:
+                    forL = -np.inf
+                if len(forU_list) > 0:
+                    forU = min(forU_list)
+                else:
+                    forU = np.inf
+                forL = max(forL, -tau[j])
+                forL_list = []
+                forU_list = []
+                cond3 = (cbc_array[:, j] < 0) & (discriminant > 0)    
+                if cbc_array[:, j][cond3].shape[0] > 0:
+                    x_small = (-vbc_array[:, j][cond3] + np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+                    x_large = (-vbc_array[:, j][cond3] - np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+                    # x_small < forL < x_large
+                    flag1 = (x_small < forL) & (forL < x_large)
+                    while np.sum(flag1) > 0:
+                        if x_large[flag1].shape[0] > 0: 
+                            argmax = np.argmax((-vbc_array[:, j][cond3][flag1] - np.sqrt(discriminant[cond3][flag1])) / cbc_array[:, j][cond3][flag1])
+                            hit_vbc_L = vbc_array[:, j][cond3][flag1][argmax]
+                            hit_cbc_L = cbc_array[:, j][cond3][flag1][argmax]
+                            hit_vbv_L = vbv_array[cond3][flag1][argmax]
+                            x_large_max = np.max(x_large[flag1])
+                            forL = x_large_max
+                        flag1 = (x_small < forL) & (forL < x_large)
+                    # x_small < forU < x_large
+                    flag2 = (x_small < forU) & (forU < x_large)
+                    while np.sum(flag2) > 0:
+                        if x_small[flag2].shape[0] > 0:
+                            x_small_min = np.min(x_small[flag2])
+                            forU = x_small_min
+                        flag2 = (x_small < forU) & (forU < x_large)
+                    # forL < x_small, x_large < forU
+                    flag3 = (forL < x_small) & (x_large < forU)
+                    if np.sum(flag3) > 0:
+                        interval_j = np.array(intersection(forL, forU, np.c_[x_small, x_large][flag3]))
+                        interval.append(interval_j + tau[j])
+                    else:
+                        interval.append(np.array([[forL, forU]]) + tau[j])                
+                else:
+                    L = forL + tau[j]
+                    if L < 0:
+                        L = 0
+                    U = forU + tau[j]
+                    interval.append(np.array([[L, U]]))
+                    
+            interval = np.array(interval)
+            # 検定
+            sig = np.sqrt(sigma_tilde2)
+            sub1 = stats.norm.cdf(tau / sig)
+            sub2 = stats.norm.cdf(-tau / sig)
+            naive_p = 2 * np.min(np.c_[sub1, sub2], axis=1)
+            selective_p = calc_multisec_p(tau, sig, interval)  
+            naive_p_step.append(naive_p)
+            selective_p_step.append(selective_p)
+    return naive_p_step, selective_p_step 
+
+
+def pci_ward_improve2(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, delta_list, tau_list, tol=10**(-12)):
+    """
+    Selective Inference at each step of hierarchical clustering
+    each feature
+    切断点を保持する
+    """
+    n = data.shape[0]
+    d = data.shape[1]        
+    naive_p_step = []
+    selective_p_step = []
+    interval_step = [[[-np.inf, np.inf] for j in range(d)] for i in range(n - 1)]
+    section_step = [[[] for j in range(d)] for i in range(n - 1)]
+    sigma_tilde2_step = []
+    for s in range(n - 1):
+        if s < stop:
+#            print("--------------------%d step --------------------" % s) 
+            """Selection Event 計算"""
+            c_list = copy.deepcopy(c_list_list[s])
+            c_ab = copy.deepcopy(c_ab_list[s])
+            a = a_list[s]
+            b = b_list[s]
+            for t in range(s, n - 1):
+#                print("---------------------t = %d---------------------" % t)
+                delta = delta_list[t]
+                tau = np.abs(tau_list[t])
+                sign = np.sign(tau_list[t])
+                delta_h = np.dot(sigma, delta)
+                sigma_tilde2 = np.diag(xi) * np.dot(np.dot(delta, sigma), delta)
+                vbv_list = []
+                cbc_list = []
+                vbc_list = []
+                e_cab = np.sum((c_ab.element - c_ab.centroid) ** 2)
+                e_ca = np.sum((c_list[a].element - c_list[a].centroid) ** 2)
+                e_cb = np.sum((c_list[b].element - c_list[b].centroid) ** 2)
+                delta_a = np.dot(c_list[a].table, delta_h) / c_list[a].size
+                delta_b = np.dot(c_list[b].table, delta_h) / c_list[b].size
+                d_ab = delta_a - delta_b
+                abab = (c_list[a].size * c_list[b].size) / c_ab.size
+                abx = c_list[a].centroid - c_list[b].centroid
+                for k1 in range(len(c_list) - 2):
+                    for k2 in range(k1 + 1, len(c_list) - 1):
+#                        if (k1, k2) != (a, b):
+#                        if k1 != k2:
+                            c_k12 = c_list[k1].merge(c_list[k2], 0)            
+                            e_ck12 = np.sum((c_k12.element - c_k12.centroid) ** 2)
+                            e_ck1 = np.sum((c_list[k1].element - c_list[k1].centroid) ** 2)
+                            e_ck2 = np.sum((c_list[k2].element - c_list[k2].centroid) ** 2)
+                            delta_k1 = np.dot(c_list[k1].table, delta_h) / c_list[k1].size
+                            delta_k2 = np.dot(c_list[k2].table, delta_h) / c_list[k2].size
+                            d_k12 = delta_k1 - delta_k2
+                            k12 = (c_list[k1].size * c_list[k2].size) / c_k12.size
+                            k12x = c_list[k1].centroid - c_list[k2].centroid
+                            # vbvは必ず0以下となる
+                            vbv = e_cab - e_ck12 - e_ca + e_ck1 - e_cb + e_ck2
+                            assert vbv <= 0, "vbv > 0 occured"
+                            vbv_list.append(vbv)
+                            scalar = abab * (d_ab**2) - k12 * (d_k12**2)
+                            cbc = (sign**2 * scalar * np.diag(np.dot(xi.T, xi))) / sigma_tilde2 ** 2
+                            cbc_list.append(cbc)
+                            d_vec = abab * d_ab * abx - k12 * d_k12 * k12x 
+                            vbc = (sign * np.dot(d_vec, xi)) / sigma_tilde2
+                            vbc_list.append(vbc)
+                    # {}_(n- t + 1) C_2個
+                vbv_array = np.array(vbv_list)
+                # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+                cbc_array = np.array(cbc_list)
+                # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+                vbc_array = np.array(vbc_list)
+    #            # L, Uがともに0となることを防ぐために閾値をもうける
+    #            cbc_array[np.abs(cbc_array) < tol] = 0
+    #            vbc_array[np.abs(vbc_array) < tol] = 0
+                # 切断点計算
+                forL_list = []
+                forU_list = []
+                interval_d = []
+                if vbv_array.shape[0] != 0:
+                    for j in range(d):
+#                        print("---------------d: %d--------------------" % j)
+                        # 判別式
+                        """
+                        切断点計算
+                        """
+                        discriminant = vbc_array[:, j]**2 - cbc_array[:, j] * vbv_array
+                        cond = cbc_array[:, j] == 0
+                        cond_l = (cbc_array[:, j] == 0) & (vbc_array[:, j] < 0)
+                        cond_u = (cbc_array[:, j] == 0) & (vbc_array[:, j] > 0)
+                        if cbc_array[cond].shape[0] > 0:
+                            if vbc_array[:, j][cond_l].shape[0] > 0:
+                                forL = np.max(-vbv_array[cond_l] / (2 * vbc_array[:, j][cond_l]))
+                                forL_list.append(forL)
+                            elif vbc_array[:, j][cond_u].shape[0] > 0:
+                                forU = np.min(-vbv_array[cond_u] / (2 * vbc_array[:, j][cond_u]))
+                                forU_list.append(forU)
+                        cond2 = cbc_array[:, j] > 0
+                        if cbc_array[:, j][cond2].shape[0] > 0:
+                            forL = np.max((-vbc_array[:, j][cond2] - np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                            forL_list.append(forL)
+                            forU = np.min((-vbc_array[:, j][cond2] + np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                            forU_list.append(forU)            
+                        if len(forL_list) > 0:
+                            forL = max(forL_list)
+                        else:
+                            forL = -np.inf
+                        if len(forU_list) > 0:
+                            forU = min(forU_list)
+                        else:
+                            forU = np.inf
+                        forL = max(forL, -tau[j])
+                        forL_list = []
+                        forU_list = []
+                        if interval_step[t][j][0] < forL + tau[j]:
+                            interval_step[t][j][0] = forL + tau[j]
+                        if interval_step[t][j][1] > forU + tau[j]:
+                            interval_step[t][j][1] = forU + tau[j]
+                        cond3 = (cbc_array[:, j] < 0) & (discriminant > 0)
+                        if cbc_array[:, j][cond3].shape[0] > 0:
+                            x_small = (-vbc_array[:, j][cond3] + np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+                            x_large = (-vbc_array[:, j][cond3] - np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+                            new_interval = np.c_[x_small + tau[j], x_large + tau[j]]                                
+                            if len(section_step[t][j]) <= 0:
+                                section_step[t][j].append(new_interval)
+                            else:
+                                section_step[t][j] = np.r_[np.array(section_step[t][j]).reshape((-1, 2)), np.array(new_interval)] 
+    """最終的な区間作成 & p値計算"""
+    final_interval = []
+    for s in range(n - 1):
+        final_interval_d = []
+        for j in range(d):       
+            if len(section_step[s][j]) != 0:
+                if np.array(section_step[s][j]).ndim > 2:
+                    section_step[s][j] = np.array(section_step[s][j][0]).reshape((-1, 2))
+                L = interval_step[s][j][0]
+                U = interval_step[s][j][1]
+                x_small = section_step[s][j][:, 0]
+                x_large = section_step[s][j][:, 1]
+                # x_small < forL < x_large                            
+                flag1 = (x_small < L) & (L < x_large)
+                while np.sum(flag1) > 0:
+                    if x_large[flag1].shape[0] > 0: 
+                        x_large_max = np.max(x_large[flag1])
+                        L = x_large_max
+                    flag1 = (x_small < L) & (L < x_large)
+                # x_small < forU < x_large
+                flag2 = (x_small < U) & (U < x_large)
+                while np.sum(flag2) > 0:
+                    if x_small[flag2].shape[0] > 0:
+                        x_small_min = np.min(x_small[flag2])
+                        U = x_small_min
+                    flag2 = (x_small < U) & (U < x_large)
+#               forL < x_small, x_large < forU
+                flag3 = (L < x_small) & (x_large < U)
+                if np.sum(flag3) > 0:
+                    new_interval = np.c_[x_small, x_large][flag3]                                
+                    new_interval_j = np.array(intersection(L, U, new_interval))
+                    final_interval_d.append(new_interval_j)
+                else:
+                    final_interval_d.append([[L, U]])
+            else:
+                final_interval_d.append(interval_step[s][j])
+        # 検定
+        tau = np.abs(tau_list[s])
+        delta = delta_list[s]
+        sigma_tilde2 = np.diag(xi) * np.dot(np.dot(delta, sigma), delta)
+        sig = np.sqrt(sigma_tilde2)
+        sub1 = stats.norm.cdf(tau / sig)
+        sub2 = stats.norm.cdf(-tau / sig)
+        naive_p = 2 * np.min(np.c_[sub1, sub2], axis=1)
+        selective_p = calc_multisec_p_improve(tau, sig, final_interval_d)  
+        naive_p_step.append(naive_p)
+        selective_p_step.append(selective_p)
+
+    return naive_p_step, selective_p_step
+
+
+def pci_ward_improve2_2(data, sigma, xi, stop, c_list_list, c_ab_list, a_list, b_list, delta_list, tau_list, tol=10**(-12)):
+    """
+    Selective Inference at each step of hierarchical clustering
+    each feature
+    切断点を保持し, ある階層のみで行う
+    """
+    n = data.shape[0]
+    d = data.shape[1]        
+    assert (stop >= 0) & (stop <= n - 2), "please input stop = 0 ~ n - 2"
+    naive_p_step = []
+    selective_p_step = []
+    interval_step = [[-np.inf, np.inf] for j in range(d)] 
+    section_step = [[] for j in range(d)] 
+    for s in range(stop + 1):
+#            print("--------------------%d step --------------------" % s) 
+        """Selection Event 計算"""
+        c_list = copy.deepcopy(c_list_list[s])
+        c_ab = copy.deepcopy(c_ab_list[s])
+        a = a_list[s]
+        b = b_list[s]
+#        for t in range(s, stop):
+#                print("---------------------t = %d---------------------" % t)
+        delta = delta_list[stop]
+        tau = np.abs(tau_list[stop])
+        sign = np.sign(tau_list[stop])
+        delta_h = np.dot(sigma, delta)
+        sigma_tilde2 = np.diag(xi) * np.dot(np.dot(delta, sigma), delta)
+        vbv_list = []
+        cbc_list = []
+        vbc_list = []
+        e_cab = np.sum((c_ab.element - c_ab.centroid) ** 2)
+        e_ca = np.sum((c_list[a].element - c_list[a].centroid) ** 2)
+        e_cb = np.sum((c_list[b].element - c_list[b].centroid) ** 2)
+        delta_a = np.dot(c_list[a].table, delta_h) / c_list[a].size
+        delta_b = np.dot(c_list[b].table, delta_h) / c_list[b].size
+        d_ab = delta_a - delta_b
+        abab = (c_list[a].size * c_list[b].size) / c_ab.size
+        abx = c_list[a].centroid - c_list[b].centroid
+        for k1 in range(len(c_list) - 2):
+            for k2 in range(k1 + 1, len(c_list) - 1):
+#                        if (k1, k2) != (a, b):
+#                        if k1 != k2:
+                    c_k12 = c_list[k1].merge(c_list[k2], 0)            
+                    e_ck12 = np.sum((c_k12.element - c_k12.centroid) ** 2)
+                    e_ck1 = np.sum((c_list[k1].element - c_list[k1].centroid) ** 2)
+                    e_ck2 = np.sum((c_list[k2].element - c_list[k2].centroid) ** 2)
+                    delta_k1 = np.dot(c_list[k1].table, delta_h) / c_list[k1].size
+                    delta_k2 = np.dot(c_list[k2].table, delta_h) / c_list[k2].size
+                    d_k12 = delta_k1 - delta_k2
+                    k12 = (c_list[k1].size * c_list[k2].size) / c_k12.size
+                    k12x = c_list[k1].centroid - c_list[k2].centroid
+                    # vbvは必ず0以下となる
+                    vbv = e_cab - e_ck12 - e_ca + e_ck1 - e_cb + e_ck2
+                    assert vbv <= 0, "vbv > 0 occured"
+                    vbv_list.append(vbv)
+                    scalar = abab * (d_ab**2) - k12 * (d_k12**2)
+                    cbc = (sign**2 * scalar * np.diag(np.dot(xi.T, xi))) / sigma_tilde2 ** 2
+                    cbc_list.append(cbc)
+                    d_vec = abab * d_ab * abx - k12 * d_k12 * k12x 
+                    vbc = (sign * np.dot(d_vec, xi)) / sigma_tilde2
+                    vbc_list.append(vbc)
+            # {}_(n- t + 1) C_2個
+        vbv_array = np.array(vbv_list)
+        # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+        cbc_array = np.array(cbc_list)
+        # {}_(n- t + 1) C_2個のd次元ベクトル shape : {}_(n - t + 1) C_2, d
+        vbc_array = np.array(vbc_list)
+#            # L, Uがともに0となることを防ぐために閾値をもうける
+#            cbc_array[np.abs(cbc_array) < tol] = 0
+#            vbc_array[np.abs(vbc_array) < tol] = 0
+        # 切断点計算
+        forL_list = []
+        forU_list = []
+        if vbv_array.shape[0] != 0:
+            for j in range(d):
+#                        print("---------------d: %d--------------------" % j)
+                # 判別式
+                """
+                切断点計算
+                """
+                discriminant = vbc_array[:, j]**2 - cbc_array[:, j] * vbv_array
+                cond = cbc_array[:, j] == 0
+                cond_l = (cbc_array[:, j] == 0) & (vbc_array[:, j] < 0)
+                cond_u = (cbc_array[:, j] == 0) & (vbc_array[:, j] > 0)
+                if cbc_array[cond].shape[0] > 0:
+                    if vbc_array[:, j][cond_l].shape[0] > 0:
+                        forL = np.max(-vbv_array[cond_l] / (2 * vbc_array[:, j][cond_l]))
+                        forL_list.append(forL)
+                    elif vbc_array[:, j][cond_u].shape[0] > 0:
+                        forU = np.min(-vbv_array[cond_u] / (2 * vbc_array[:, j][cond_u]))
+                        forU_list.append(forU)
+                cond2 = cbc_array[:, j] > 0
+                if cbc_array[:, j][cond2].shape[0] > 0:
+                    forL = np.max((-vbc_array[:, j][cond2] - np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                    forL_list.append(forL)
+                    forU = np.min((-vbc_array[:, j][cond2] + np.sqrt(discriminant[cond2])) / cbc_array[:, j][cond2])
+                    forU_list.append(forU)            
+                if len(forL_list) > 0:
+                    forL = max(forL_list)
+                else:
+                    forL = -np.inf
+                if len(forU_list) > 0:
+                    forU = min(forU_list)
+                else:
+                    forU = np.inf
+                forL = max(forL, -tau[j])
+                forL_list = []
+                forU_list = []
+                if interval_step[j][0] < forL + tau[j]:
+                    interval_step[j][0] = forL + tau[j]
+                if interval_step[j][1] > forU + tau[j]:
+                    interval_step[j][1] = forU + tau[j]
+                cond3 = (cbc_array[:, j] < 0) & (discriminant > 0)
+                if cbc_array[:, j][cond3].shape[0] > 0:
+                    x_small = (-vbc_array[:, j][cond3] + np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+                    x_large = (-vbc_array[:, j][cond3] - np.sqrt(discriminant[cond3])) / cbc_array[:, j][cond3]
+                    new_interval = np.c_[x_small + tau[j], x_large + tau[j]]                                
+                    if len(section_step[j]) <= 0:
+                        section_step[j].append(new_interval)
+                    else:
+                        section_step[j] = np.r_[np.array(section_step[j]).reshape((-1, 2)), np.array(new_interval)] 
+    """最終的な区間作成 & p値計算"""
+#    final_interval = []
+#    for s in range(n - 1):
+    final_interval_d = []
+    for j in range(d):       
+        if len(section_step[j]) != 0:
+            if np.array(section_step[j]).ndim > 2:
+                section_step[j] = np.array(section_step[j][0]).reshape((-1, 2))
+            L = interval_step[j][0]
+            U = interval_step[j][1]
+            x_small = section_step[j][:, 0]
+            x_large = section_step[j][:, 1]
+            # x_small < forL < x_large                            
+            flag1 = (x_small < L) & (L < x_large)
+            while np.sum(flag1) > 0:
+                if x_large[flag1].shape[0] > 0: 
+                    x_large_max = np.max(x_large[flag1])
+                    L = x_large_max
+                flag1 = (x_small < L) & (L < x_large)
+            # x_small < forU < x_large
+            flag2 = (x_small < U) & (U < x_large)
+            while np.sum(flag2) > 0:
+                if x_small[flag2].shape[0] > 0:
+                    x_small_min = np.min(x_small[flag2])
+                    U = x_small_min
+                flag2 = (x_small < U) & (U < x_large)
+#               forL < x_small, x_large < forU
+            flag3 = (L < x_small) & (x_large < U)
+            if np.sum(flag3) > 0:
+                new_interval = np.c_[x_small, x_large][flag3]                                
+                new_interval_j = np.array(intersection(L, U, new_interval))
+                final_interval_d.append(new_interval_j)
+            else:
+                final_interval_d.append([[L, U]])
+        else:
+            final_interval_d.append(interval_step[j])
+    # 検定
+    tau = np.abs(tau_list[stop])
+    delta = delta_list[stop]
+    sigma_tilde2 = np.diag(xi) * np.dot(np.dot(delta, sigma), delta)
+    sig = np.sqrt(sigma_tilde2)
+    sub1 = stats.norm.cdf(tau / sig)
+    sub2 = stats.norm.cdf(-tau / sig)
+    naive_p = 2 * np.min(np.c_[sub1, sub2], axis=1)
+    selective_p = calc_multisec_p_improve(tau, sig, final_interval_d)  
+    naive_p_step.append(naive_p)
+    selective_p_step.append(selective_p)
+
+    return naive_p_step, selective_p_step
 
